@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/sync/errgroup"
 )
 
 type Entry struct {
@@ -45,12 +47,19 @@ func (e *Entry) Log(log *zap.Logger) {
 	}
 }
 
-func logProxy(log *zap.Logger) io.Writer {
+func logProxy(log *zap.Logger, g *errgroup.Group) (io.Writer, context.CancelFunc) {
 	r, w := io.Pipe()
 
-	go func() {
-		// TODO: Graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+
+	g.Go(func() error {
+		<-ctx.Done()
+		return r.Close()
+	})
+	g.Go(func() error {
 		s := bufio.NewScanner(r)
+		log.Info("Log streaming started")
+		defer log.Info("Log streaming ended")
 		for s.Scan() {
 			var e Entry
 			if err := json.Unmarshal(s.Bytes(), &e); err != nil {
@@ -59,7 +68,8 @@ func logProxy(log *zap.Logger) io.Writer {
 			}
 			e.Log(log)
 		}
-	}()
+		return s.Err()
+	})
 
-	return w
+	return w, cancel
 }

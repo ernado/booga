@@ -98,11 +98,16 @@ func run(ctx context.Context, log *zap.Logger) error {
 
 	cmd := exec.CommandContext(gCtx, *mongod, "--config", "mongod.conf")
 	cmd.Stderr = os.Stderr
-	cmd.Stdout = logProxy(log.Named("mongo"))
+	logReader, logFlush := logProxy(log.Named("mongo"), g)
+
+	cmd.Stdout = logReader
 	cmd.Dir = instanceDir
 
 	log.Info("Starting", zap.String("dir", instanceDir))
-	g.Go(cmd.Run)
+	g.Go(func() error {
+		defer logFlush()
+		return cmd.Run()
+	})
 	g.Go(func() error {
 		ctx, cancel := context.WithTimeout(gCtx, time.Second*10)
 		defer cancel()
