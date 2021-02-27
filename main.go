@@ -8,10 +8,13 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -90,7 +93,10 @@ func ensureServer(ctx context.Context, log *zap.Logger, uri string) error {
 		return xerrors.Errorf("ping: %w", err)
 	}
 
-	log.Info("Connected", zap.Duration("duration", time.Since(start)))
+	log.Info("Connected",
+		zap.Duration("d", time.Since(start)),
+		zap.String("uri", uri),
+	)
 
 	return nil
 }
@@ -158,8 +164,11 @@ func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
 		ctx, cancel := context.WithTimeout(gCtx, time.Second*10)
 		defer cancel()
 
-		uri := fmt.Sprintf("mongodb://%s:%d", cfg.IP, cfg.Port)
-		if err := ensureServer(ctx, log, uri); err != nil {
+		uri := &url.URL{
+			Scheme: "mongodb",
+			Host:   net.JoinHostPort(cfg.IP, strconv.Itoa(cfg.Port)),
+		}
+		if err := ensureServer(ctx, log, uri.String()); err != nil {
 			return xerrors.Errorf("ensure server: %w", err)
 		}
 
