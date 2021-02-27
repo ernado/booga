@@ -30,7 +30,8 @@ func (e *Entry) Log(log *zap.Logger) {
 	switch e.Severity {
 	case "W":
 		severity = zapcore.WarnLevel
-	case "E":
+	case "E", "F":
+		// We can't use Fatal level because this will call os.Exit.
 		severity = zapcore.ErrorLevel
 	}
 	if ce := log.Check(severity, e.Message); ce != nil {
