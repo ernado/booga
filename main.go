@@ -1,23 +1,21 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"embed"
-	"errors"
 	"flag"
 	"fmt"
-	"html/template"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.uber.org/zap"
@@ -25,12 +23,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 )
-
-type templateContext struct {
-	Path string
-	IP   string
-	Port int
-}
 
 func ensureDir(name string) error {
 	if err := os.MkdirAll(name, 0700); err != nil {
@@ -50,44 +42,25 @@ func ensureTempDir(name string) (context.CancelFunc, error) {
 	}, nil
 }
 
-//go:embed _templates
-var templates embed.FS
-
-func executeTo(t *template.Template, name string, data interface{}) error {
-	buf := new(bytes.Buffer)
-	if err := t.Execute(buf, data); err != nil {
-		return xerrors.Errorf("template: %w", err)
-	}
-
-	if err := os.WriteFile(name, buf.Bytes(), 0600); err != nil {
-		return xerrors.Errorf("write: %w", err)
-	}
-
-	return nil
-}
-
 // ensureServer ensures that mongo server is up on given uri.
-func ensureServer(ctx context.Context, log *zap.Logger, uri string) error {
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
-	if err != nil {
-		return xerrors.Errorf("connect: %w", err)
-	}
-
-	defer func() {
-		_ = client.Disconnect(ctx)
-		log.Info("Disconnected")
-	}()
-
-	b := backoff.NewConstantBackOff(time.Millisecond * 50)
+func ensureServer(ctx context.Context, log *zap.Logger, client *mongo.Client) error {
+	b := backoff.NewConstantBackOff(time.Millisecond * 100)
 
 	start := time.Now()
 	if err := backoff.Retry(func() error {
-		if err := client.Ping(ctx, nil); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return backoff.Permanent(err)
+		// Set separate timeout for single try.
+		pingCtx, cancel := context.WithTimeout(ctx, time.Millisecond*500)
+		defer cancel()
+
+		if err := client.Ping(pingCtx, nil); err != nil {
+			select {
+			case <-ctx.Done():
+				return backoff.Permanent(ctx.Err())
+			default:
+				return err
 			}
-			return err
 		}
+
 		return nil
 	}, backoff.WithContext(b, ctx)); err != nil {
 		return xerrors.Errorf("ping: %w", err)
@@ -95,7 +68,6 @@ func ensureServer(ctx context.Context, log *zap.Logger, uri string) error {
 
 	log.Info("Connected",
 		zap.Duration("d", time.Since(start)),
-		zap.String("uri", uri),
 	)
 
 	return nil
@@ -103,10 +75,16 @@ func ensureServer(ctx context.Context, log *zap.Logger, uri string) error {
 
 // Options for running mongo.
 type Options struct {
-	BinaryPath     string
-	BaseDir        string
-	Name           string
-	ConfigTemplate *template.Template
+	BinaryPath       string
+	BaseDir          string
+	Name             string
+	ReplicaSet       string
+	ConfigServer     bool
+	ShardServer      bool
+	RoutingServer    bool
+	ConfigServerAddr string
+
+	OnReady func(ctx context.Context, client *mongo.Client) error
 
 	IP   string
 	Port int
@@ -133,18 +111,6 @@ func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
 		return xerrors.Errorf("ensure data dir: %w", err)
 	}
 
-	// Rendering configuration file for instance.
-	const cfgName = "mongo.conf"
-	cfgPath := filepath.Join(dir, cfgName)
-	cfg := templateContext{
-		Path: dataDir,
-		IP:   opt.IP,
-		Port: opt.Port,
-	}
-	if err := executeTo(opt.ConfigTemplate, cfgPath, cfg); err != nil {
-		return xerrors.Errorf("template: %w", err)
-	}
-
 	g, gCtx := errgroup.WithContext(ctx)
 
 	log.Info("Starting", zap.String("dir", dir))
@@ -153,23 +119,61 @@ func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
 		logReader, logFlush := logProxy(log.Named("mongo"), g)
 		defer logFlush()
 
-		cmd := exec.CommandContext(gCtx, opt.BinaryPath, "--config", cfgName)
+		args := []string{
+			"--bind_ip", opt.IP,
+			"--port", strconv.Itoa(opt.Port),
+		}
+
+		if opt.ConfigServer {
+			args = append(args, "--configsvr")
+		}
+		if opt.ShardServer {
+			args = append(args, "--shardsvr")
+		}
+		if opt.RoutingServer {
+			args = append(args, "--configdb", opt.ConfigServerAddr)
+		} else {
+			args = append(args, "--replSet", opt.ReplicaSet, "--dbpath", dataDir)
+		}
+
+		cmd := exec.CommandContext(gCtx, opt.BinaryPath, args...)
 		cmd.Stdout = logReader
+		cmd.Stderr = logReader
 		cmd.Dir = dir
 
 		return cmd.Run()
 	})
 	g.Go(func() error {
 		// Waiting up to 10 seconds for mongo server to be available.
-		ctx, cancel := context.WithTimeout(gCtx, time.Second*10)
+		ctx, cancel := context.WithTimeout(gCtx, time.Second*5)
 		defer cancel()
 
 		uri := &url.URL{
 			Scheme: "mongodb",
-			Host:   net.JoinHostPort(cfg.IP, strconv.Itoa(cfg.Port)),
+			Host:   net.JoinHostPort(opt.IP, strconv.Itoa(opt.Port)),
+			Path:   "/",
 		}
-		if err := ensureServer(ctx, log, uri.String()); err != nil {
+
+		client, err := mongo.Connect(ctx, options.Client().
+			ApplyURI(uri.String()).
+			// SetDirect is important, client can timeout otherwise.
+			SetDirect(true),
+		)
+		if err != nil {
+			return xerrors.Errorf("connect: %w", err)
+		}
+
+		defer func() {
+			_ = client.Disconnect(ctx)
+			log.Info("Disconnected")
+		}()
+
+		if err := ensureServer(ctx, log, client); err != nil {
 			return xerrors.Errorf("ensure server: %w", err)
+		}
+
+		if err := opt.OnReady(ctx, client); err != nil {
+			return xerrors.Errorf("onReady: %w", err)
 		}
 
 		return nil
@@ -179,29 +183,123 @@ func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
 }
 
 func run(ctx context.Context, log *zap.Logger) error {
-	mongod := flag.String("bin", "/usr/bin/mongod", "path for mongod")
+	mongod := flag.String("mongod", "/usr/bin/mongod", "path for mongod")
+	mongos := flag.String("mongos", "/usr/bin/mongos", "path for mongos")
 	baseDir := flag.String("dir", "", "dir to use for data (default to current dir)")
 	flag.Parse()
 
-	t, err := template.ParseFS(templates, "_templates/*.tpl")
-	if err != nil {
-		return xerrors.Errorf("parse templates: %w", err)
-	}
+	const (
+		rsData   = "rsData"
+		rsConfig = "rsConfig"
+	)
 
-	// Running single instance until ctrl+C.
-	if err := runServer(ctx, log, Options{
-		Name:           "db1",
-		BaseDir:        *baseDir,
-		BinaryPath:     *mongod,
-		ConfigTemplate: t,
+	g, gCtx := errgroup.WithContext(ctx)
+	replicaSetInitialized := make(chan struct{})
 
-		IP:   "127.0.0.1",
-		Port: 28013,
-	}); err != nil {
-		return xerrors.Errorf("run: %w", err)
-	}
+	// Configuration servers.
+	g.Go(func() error {
+		return runServer(gCtx, log, Options{
+			Name:         "cfg",
+			BaseDir:      *baseDir,
+			BinaryPath:   *mongod,
+			ReplicaSet:   rsConfig,
+			ConfigServer: true,
+			OnReady: func(ctx context.Context, client *mongo.Client) error {
+				// Initializing config replica set.
+				rsConfig := bson.M{
+					"_id": rsConfig,
+					"members": []bson.M{
+						{"_id": 0, "host": "127.0.0.1:28001"},
+					},
+				}
+				if err := client.Database("admin").
+					RunCommand(ctx, bson.M{"replSetInitiate": rsConfig}).
+					Err(); err != nil {
+					return xerrors.Errorf("replSetInitiate: %w", err)
+				}
 
-	return nil
+				log.Info("Config replica set initialized")
+				close(replicaSetInitialized)
+
+				return nil
+			},
+
+			IP:   "127.0.0.1",
+			Port: 28001,
+		})
+	})
+
+	// Data servers.
+	g.Go(func() error {
+		select {
+		case <-replicaSetInitialized:
+		case <-gCtx.Done():
+			return gCtx.Err()
+		}
+
+		return runServer(gCtx, log, Options{
+			Name:        "shard1",
+			BaseDir:     *baseDir,
+			BinaryPath:  *mongod,
+			ReplicaSet:  rsData,
+			ShardServer: true,
+
+			OnReady: func(ctx context.Context, client *mongo.Client) error {
+				// Initializing replica set.
+				rsConfig := bson.M{
+					"_id": rsData,
+					"members": []bson.M{
+						{"_id": 0, "host": "127.0.0.1:29001"},
+					},
+				}
+				if err := client.Database("admin").
+					RunCommand(ctx, bson.M{"replSetInitiate": rsConfig}).
+					Err(); err != nil {
+					return xerrors.Errorf("replSetInitiate: %w", err)
+				}
+
+				log.Info("Data replica set initialized")
+
+				return nil
+			},
+
+			IP:   "127.0.0.1",
+			Port: 29001,
+		})
+	})
+
+	// Routing or "mongos" servers.
+	g.Go(func() error {
+		select {
+		case <-replicaSetInitialized:
+		case <-gCtx.Done():
+			return gCtx.Err()
+		}
+
+		return runServer(gCtx, log, Options{
+			Name:             "routing",
+			BinaryPath:       *mongos,
+			RoutingServer:    true,
+			ConfigServerAddr: path.Join(rsConfig, "127.0.0.1:28001"),
+
+			OnReady: func(ctx context.Context, client *mongo.Client) error {
+				if err := client.Database("admin").
+					RunCommand(ctx, bson.M{"addShard": path.Join(rsData, "127.0.0.1:29001")}).
+					Err(); err != nil {
+					return xerrors.Errorf("addShard: %w", err)
+				}
+
+				log.Info("Shard added")
+
+				return nil
+			},
+
+			IP:   "127.0.0.1",
+			Port: 29501,
+		})
+	})
+
+	return g.Wait()
 }
 
 func main() {
