@@ -123,7 +123,7 @@ func run(ctx context.Context, log *zap.Logger) error {
 			log.Info("Disconnected")
 		}()
 
-		b := backoff.WithMaxRetries(backoff.NewConstantBackOff(time.Millisecond*50), 50)
+		b := backoff.NewConstantBackOff(time.Millisecond * 50)
 
 		start := time.Now()
 		if err := backoff.Retry(func() error {
@@ -134,7 +134,7 @@ func run(ctx context.Context, log *zap.Logger) error {
 				return err
 			}
 			return nil
-		}, b); err != nil {
+		}, backoff.WithContext(b, ctx)); err != nil {
 			return fmt.Errorf("ping: %w", err)
 		}
 
