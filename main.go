@@ -95,48 +95,60 @@ func ensureServer(ctx context.Context, log *zap.Logger, uri string) error {
 	return nil
 }
 
-func run(ctx context.Context, log *zap.Logger) error {
-	mongod := flag.String("bin", "/usr/bin/mongod", "path for mongod")
-	baseDir := flag.String("dir", "", "dir to use for data (default to current dir)")
-	flag.Parse()
+// Options for running mongo.
+type Options struct {
+	BinaryPath     string
+	BaseDir        string
+	Name           string
+	ConfigTemplate *template.Template
 
-	t, err := template.ParseFS(templates, "_templates/*.tpl")
-	if err != nil {
-		return xerrors.Errorf("parse templates: %w", err)
-	}
+	IP   string
+	Port int
+}
 
-	instanceDir := filepath.Join(*baseDir, "db1")
-	dirCleanup, err := ensureTempDir(instanceDir)
+// runServer runs mongo server with provided options until error or context
+// cancellation.
+func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
+	log = log.Named(opt.Name)
+
+	// Ensuring instance directory.
+	dir := filepath.Join(opt.BaseDir, opt.Name)
+	dirCleanup, err := ensureTempDir(dir)
 	if err != nil {
 		return xerrors.Errorf("ensure dir: %w", err)
 	}
+	// Directory will be removed recursively on cleanup.
 	defer dirCleanup()
 
-	dataDir := filepath.Join(instanceDir, "data")
-	if err := ensureDir(dataDir); err != nil {
+	// Ensuring data directory.
+	const dataDir = "data"
+	dataPath := filepath.Join(dir, dataDir)
+	if err := ensureDir(dataPath); err != nil {
 		return xerrors.Errorf("ensure data dir: %w", err)
 	}
 
-	cfgPath := filepath.Join(instanceDir, "mongod.conf")
+	// Rendering configuration file for instance.
+	const cfgName = "mongo.conf"
+	cfgPath := filepath.Join(dir, cfgName)
 	cfg := templateContext{
-		Path: "data",
-		IP:   "127.0.0.1",
-		Port: 28001,
+		Path: dataDir,
+		IP:   opt.IP,
+		Port: opt.Port,
 	}
-	if err := executeTo(t, cfgPath, cfg); err != nil {
+	if err := executeTo(opt.ConfigTemplate, cfgPath, cfg); err != nil {
 		return xerrors.Errorf("template: %w", err)
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
 
-	cmd := exec.CommandContext(gCtx, *mongod, "--config", "mongod.conf")
+	cmd := exec.CommandContext(gCtx, opt.BinaryPath, "--config", cfgName)
 	cmd.Stderr = os.Stderr
 	logReader, logFlush := logProxy(log.Named("mongo"), g)
 
 	cmd.Stdout = logReader
-	cmd.Dir = instanceDir
+	cmd.Dir = dir
 
-	log.Info("Starting", zap.String("dir", instanceDir))
+	log.Info("Starting", zap.String("dir", dir))
 	g.Go(func() error {
 		defer logFlush()
 		return cmd.Run()
@@ -155,6 +167,32 @@ func run(ctx context.Context, log *zap.Logger) error {
 	})
 
 	return g.Wait()
+}
+
+func run(ctx context.Context, log *zap.Logger) error {
+	mongod := flag.String("bin", "/usr/bin/mongod", "path for mongod")
+	baseDir := flag.String("dir", "", "dir to use for data (default to current dir)")
+	flag.Parse()
+
+	t, err := template.ParseFS(templates, "_templates/*.tpl")
+	if err != nil {
+		return xerrors.Errorf("parse templates: %w", err)
+	}
+
+	// Running single instance until ctrl+C.
+	if err := runServer(ctx, log, Options{
+		Name:           "db1",
+		BaseDir:        *baseDir,
+		BinaryPath:     *mongod,
+		ConfigTemplate: t,
+
+		IP:   "127.0.0.1",
+		Port: 28013,
+	}); err != nil {
+		return xerrors.Errorf("run: %w", err)
+	}
+
+	return nil
 }
 
 func main() {
