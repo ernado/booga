@@ -12,6 +12,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// Entry represents single mongo log entry.
+//
+// See https://docs.mongodb.com/manual/reference/log-messages/
 type Entry struct {
 	Severity   string                 `json:"s"`
 	System     string                 `json:"c"`
@@ -25,6 +28,7 @@ type Entry struct {
 	} `json:"t"`
 }
 
+// Log writes Entry to zap logger as structured log entry.
 func (e *Entry) Log(log *zap.Logger) {
 	var severity zapcore.Level
 	switch e.Severity {
@@ -48,6 +52,10 @@ func (e *Entry) Log(log *zap.Logger) {
 	}
 }
 
+// logProxy returns io.Writer that can be used as mongo log output.
+//
+// The io.Writer will parse json logs and write them to provided logger.
+// Call context.CancelFunc on mongo exit.
 func logProxy(log *zap.Logger, g *errgroup.Group) (io.Writer, context.CancelFunc) {
 	r, w := io.Pipe()
 
