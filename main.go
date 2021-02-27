@@ -20,6 +20,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/xerrors"
 )
 
 type templateContext struct {
@@ -30,7 +31,7 @@ type templateContext struct {
 
 func ensureDir(name string) error {
 	if err := os.MkdirAll(name, 0700); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
+		return xerrors.Errorf("mkdir: %w", err)
 	}
 
 	return nil
@@ -52,12 +53,44 @@ var templates embed.FS
 func executeTo(t *template.Template, name string, data interface{}) error {
 	buf := new(bytes.Buffer)
 	if err := t.Execute(buf, data); err != nil {
-		return fmt.Errorf("template: %w", err)
+		return xerrors.Errorf("template: %w", err)
 	}
 
 	if err := os.WriteFile(name, buf.Bytes(), 0600); err != nil {
-		return fmt.Errorf("write: %w", err)
+		return xerrors.Errorf("write: %w", err)
 	}
+
+	return nil
+}
+
+// ensureServer ensures that mongo server is up on given uri.
+func ensureServer(ctx context.Context, log *zap.Logger, uri string) error {
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	if err != nil {
+		return xerrors.Errorf("connect: %w", err)
+	}
+
+	defer func() {
+		_ = client.Disconnect(ctx)
+		log.Info("Disconnected")
+	}()
+
+	b := backoff.NewConstantBackOff(time.Millisecond * 50)
+
+	start := time.Now()
+	if err := backoff.Retry(func() error {
+		if err := client.Ping(ctx, nil); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return backoff.Permanent(err)
+			}
+			return err
+		}
+		return nil
+	}, backoff.WithContext(b, ctx)); err != nil {
+		return xerrors.Errorf("ping: %w", err)
+	}
+
+	log.Info("Connected", zap.Duration("duration", time.Since(start)))
 
 	return nil
 }
@@ -69,19 +102,19 @@ func run(ctx context.Context, log *zap.Logger) error {
 
 	t, err := template.ParseFS(templates, "_templates/*.tpl")
 	if err != nil {
-		return fmt.Errorf("parse templates: %w", err)
+		return xerrors.Errorf("parse templates: %w", err)
 	}
 
 	instanceDir := filepath.Join(*baseDir, "db1")
 	dirCleanup, err := ensureTempDir(instanceDir)
 	if err != nil {
-		return fmt.Errorf("ensure dir: %w", err)
+		return xerrors.Errorf("ensure dir: %w", err)
 	}
 	defer dirCleanup()
 
 	dataDir := filepath.Join(instanceDir, "data")
 	if err := ensureDir(dataDir); err != nil {
-		return fmt.Errorf("ensure data dir: %w", err)
+		return xerrors.Errorf("ensure data dir: %w", err)
 	}
 
 	cfgPath := filepath.Join(instanceDir, "mongod.conf")
@@ -91,7 +124,7 @@ func run(ctx context.Context, log *zap.Logger) error {
 		Port: 28001,
 	}
 	if err := executeTo(t, cfgPath, cfg); err != nil {
-		return fmt.Errorf("template: %w", err)
+		return xerrors.Errorf("template: %w", err)
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
@@ -109,36 +142,14 @@ func run(ctx context.Context, log *zap.Logger) error {
 		return cmd.Run()
 	})
 	g.Go(func() error {
+		// Waiting up to 10 seconds for mongo server to be available.
 		ctx, cancel := context.WithTimeout(gCtx, time.Second*10)
 		defer cancel()
 
 		uri := fmt.Sprintf("mongodb://%s:%d", cfg.IP, cfg.Port)
-		client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
-		if err != nil {
-			return fmt.Errorf("connect: %w", err)
+		if err := ensureServer(ctx, log, uri); err != nil {
+			return xerrors.Errorf("ensure server: %w", err)
 		}
-
-		defer func() {
-			_ = client.Disconnect(gCtx)
-			log.Info("Disconnected")
-		}()
-
-		b := backoff.NewConstantBackOff(time.Millisecond * 50)
-
-		start := time.Now()
-		if err := backoff.Retry(func() error {
-			if err := client.Ping(ctx, nil); err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					return backoff.Permanent(err)
-				}
-				return err
-			}
-			return nil
-		}, backoff.WithContext(b, ctx)); err != nil {
-			return fmt.Errorf("ping: %w", err)
-		}
-
-		log.Info("Connected", zap.Duration("duration", time.Since(start)))
 
 		return nil
 	})
