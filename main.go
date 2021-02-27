@@ -141,16 +141,16 @@ func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
 
 	g, gCtx := errgroup.WithContext(ctx)
 
-	cmd := exec.CommandContext(gCtx, opt.BinaryPath, "--config", cfgName)
-	cmd.Stderr = os.Stderr
-	logReader, logFlush := logProxy(log.Named("mongo"), g)
-
-	cmd.Stdout = logReader
-	cmd.Dir = dir
-
 	log.Info("Starting", zap.String("dir", dir))
 	g.Go(func() error {
+		// Piping mongo logs to zap logger.
+		logReader, logFlush := logProxy(log.Named("mongo"), g)
 		defer logFlush()
+
+		cmd := exec.CommandContext(gCtx, opt.BinaryPath, "--config", cfgName)
+		cmd.Stdout = logReader
+		cmd.Dir = dir
+
 		return cmd.Run()
 	})
 	g.Go(func() error {
