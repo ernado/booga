@@ -116,7 +116,7 @@ func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
 	log.Info("Starting", zap.String("dir", dir))
 	g.Go(func() error {
 		// Piping mongo logs to zap logger.
-		logReader, logFlush := logProxy(log.Named("mongo"), g)
+		logReader, logFlush := logProxy(log, g)
 		defer logFlush()
 
 		args := []string{
@@ -244,7 +244,7 @@ func ensureCluster(ctx context.Context, log *zap.Logger, cfg ClusterConfig) erro
 		}
 
 		return runServer(gCtx, log, Options{
-			Name:        "shard1",
+			Name:        "data",
 			BaseDir:     cfg.Dir,
 			BinaryPath:  cfg.Mongod,
 			ReplicaSet:  rsData,
