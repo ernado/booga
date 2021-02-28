@@ -182,26 +182,32 @@ func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
 	return g.Wait()
 }
 
-func run(ctx context.Context, log *zap.Logger) error {
-	mongod := flag.String("mongod", "/usr/bin/mongod", "path for mongod")
-	mongos := flag.String("mongos", "/usr/bin/mongos", "path for mongos")
-	baseDir := flag.String("dir", "", "dir to use for data (default to current dir)")
-	flag.Parse()
+type ClusterConfig struct {
+	Mongod string // mongod binary path
+	Mongos string // mongos binary path
+
+	Dir string // base directory
+	DB  string // database name
+
+	// OnSetup is called
+	OnSetup func(ctx context.Context, client *mongo.Client) error
+}
+
+func ensureCluster(ctx context.Context, log *zap.Logger, cfg ClusterConfig) error {
+	g, gCtx := errgroup.WithContext(ctx)
+	replicaSetInitialized := make(chan struct{})
 
 	const (
 		rsData   = "rsData"
 		rsConfig = "rsConfig"
 	)
 
-	g, gCtx := errgroup.WithContext(ctx)
-	replicaSetInitialized := make(chan struct{})
-
 	// Configuration servers.
 	g.Go(func() error {
 		return runServer(gCtx, log, Options{
 			Name:         "cfg",
-			BaseDir:      *baseDir,
-			BinaryPath:   *mongod,
+			BaseDir:      cfg.Dir,
+			BinaryPath:   cfg.Mongod,
 			ReplicaSet:   rsConfig,
 			ConfigServer: true,
 			OnReady: func(ctx context.Context, client *mongo.Client) error {
@@ -239,8 +245,8 @@ func run(ctx context.Context, log *zap.Logger) error {
 
 		return runServer(gCtx, log, Options{
 			Name:        "shard1",
-			BaseDir:     *baseDir,
-			BinaryPath:  *mongod,
+			BaseDir:     cfg.Dir,
+			BinaryPath:  cfg.Mongod,
 			ReplicaSet:  rsData,
 			ShardServer: true,
 
@@ -278,7 +284,7 @@ func run(ctx context.Context, log *zap.Logger) error {
 
 		return runServer(gCtx, log, Options{
 			Name:             "routing",
-			BinaryPath:       *mongos,
+			BinaryPath:       cfg.Mongos,
 			RoutingServer:    true,
 			ConfigServerAddr: path.Join(rsConfig, "127.0.0.1:28001"),
 
@@ -291,6 +297,26 @@ func run(ctx context.Context, log *zap.Logger) error {
 
 				log.Info("Shard added")
 
+				log.Info("Initializing database")
+				// Mongo does not provide explicit way to create database.
+				// Just creating void collection.
+				if err := client.Database(cfg.DB).CreateCollection(ctx, "_init"); err != nil {
+					return xerrors.Errorf("create collection: %w", err)
+				}
+
+				log.Info("Enabling sharding")
+				if err := client.Database("admin").
+					RunCommand(ctx, bson.M{"enableSharding": cfg.DB}).
+					Err(); err != nil {
+					return xerrors.Errorf("enableSharding: %w", err)
+				}
+
+				log.Info("Sharding enabled", zap.String("db", cfg.DB))
+
+				if err := cfg.OnSetup(ctx, client); err != nil {
+					return xerrors.Errorf("OnSetup: %w", err)
+				}
+
 				return nil
 			},
 
@@ -300,6 +326,30 @@ func run(ctx context.Context, log *zap.Logger) error {
 	})
 
 	return g.Wait()
+}
+
+func run(ctx context.Context, log *zap.Logger) error {
+	var (
+		mongod  = flag.String("mongod", "/usr/bin/mongod", "path for mongod")
+		mongos  = flag.String("mongos", "/usr/bin/mongos", "path for mongos")
+		baseDir = flag.String("dir", "", "dir to use for data (default to current dir)")
+	)
+	flag.Parse()
+
+	if err := ensureCluster(ctx, log, ClusterConfig{
+		Mongod: *mongod,
+		Mongos: *mongos,
+		Dir:    *baseDir,
+		DB:     "cloud",
+		OnSetup: func(ctx context.Context, client *mongo.Client) error {
+			log.Info("Cluster is up")
+			return nil
+		},
+	}); err != nil {
+		return xerrors.Errorf("ensure cluster: %w", err)
+	}
+
+	return nil
 }
 
 func main() {
