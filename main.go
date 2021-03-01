@@ -73,16 +73,27 @@ func ensureServer(ctx context.Context, log *zap.Logger, client *mongo.Client) er
 	return nil
 }
 
+type ServerType byte
+
+const (
+	// DataServer is just regular mongo instance.
+	DataServer ServerType = iota
+	// ConfigServer is topology configuration mongo instance.
+	ConfigServer
+	// RoutingServer is router (proxy) for queries, mongos.
+	RoutingServer
+)
+
 // Options for running mongo.
 type Options struct {
-	BinaryPath       string
-	BaseDir          string
-	Name             string
-	ReplicaSet       string
-	ConfigServer     bool
-	ShardServer      bool
-	RoutingServer    bool
-	ConfigServerAddr string
+	Type       ServerType
+	BinaryPath string
+	Name       string
+
+	ReplicaSet string // only for ConfigServer or DataServer
+	BaseDir    string // only for ConfigServer or DataServer
+
+	ConfigServerAddr string // only for RoutingServer
 
 	OnReady func(ctx context.Context, client *mongo.Client) error
 
@@ -95,25 +106,22 @@ type Options struct {
 func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
 	log = log.Named(opt.Name)
 
-	// Ensuring instance directory.
 	dir := filepath.Join(opt.BaseDir, opt.Name)
-	dirCleanup, err := ensureTempDir(dir)
-	if err != nil {
-		return xerrors.Errorf("ensure dir: %w", err)
-	}
-	// Directory will be removed recursively on cleanup.
-	defer dirCleanup()
-
-	// Ensuring data directory.
-	const dataDir = "data"
-	dataPath := filepath.Join(dir, dataDir)
-	if err := ensureDir(dataPath); err != nil {
-		return xerrors.Errorf("ensure data dir: %w", err)
+	switch opt.Type {
+	case DataServer, ConfigServer:
+		// Ensuring instance directory.
+		log.Info("State will be persisted to tmp directory", zap.String("dir", dir))
+		cleanup, err := ensureTempDir(dir)
+		if err != nil {
+			return xerrors.Errorf("ensure dir: %w", err)
+		}
+		// Directory will be removed recursively on cleanup.
+		defer cleanup()
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
 
-	log.Info("Starting", zap.String("dir", dir))
+	log.Info("Starting")
 	g.Go(func() error {
 		// Piping mongo logs to zap logger.
 		logReader, logFlush := logProxy(log, g)
@@ -124,22 +132,29 @@ func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
 			"--port", strconv.Itoa(opt.Port),
 		}
 
-		if opt.ConfigServer {
+		switch opt.Type {
+		case ConfigServer:
 			args = append(args, "--configsvr")
-		}
-		if opt.ShardServer {
+		case DataServer:
 			args = append(args, "--shardsvr")
 		}
-		if opt.RoutingServer {
+
+		switch opt.Type {
+		case ConfigServer, DataServer:
+			args = append(args, "--replSet", opt.ReplicaSet, "--dbpath", ".")
+		case RoutingServer:
+			// Routing server is stateless.
 			args = append(args, "--configdb", opt.ConfigServerAddr)
-		} else {
-			args = append(args, "--replSet", opt.ReplicaSet, "--dbpath", dataDir)
 		}
 
 		cmd := exec.CommandContext(gCtx, opt.BinaryPath, args...)
 		cmd.Stdout = logReader
 		cmd.Stderr = logReader
-		cmd.Dir = dir
+
+		switch opt.Type {
+		case ConfigServer, DataServer:
+			cmd.Dir = dir
+		}
 
 		return cmd.Run()
 	})
@@ -205,11 +220,11 @@ func ensureCluster(ctx context.Context, log *zap.Logger, cfg ClusterConfig) erro
 	// Configuration servers.
 	g.Go(func() error {
 		return runServer(gCtx, log, Options{
-			Name:         "cfg",
-			BaseDir:      cfg.Dir,
-			BinaryPath:   cfg.Mongod,
-			ReplicaSet:   rsConfig,
-			ConfigServer: true,
+			Name:       "cfg",
+			BaseDir:    cfg.Dir,
+			BinaryPath: cfg.Mongod,
+			ReplicaSet: rsConfig,
+			Type:       ConfigServer,
 			OnReady: func(ctx context.Context, client *mongo.Client) error {
 				// Initializing config replica set.
 				rsConfig := bson.M{
@@ -244,11 +259,11 @@ func ensureCluster(ctx context.Context, log *zap.Logger, cfg ClusterConfig) erro
 		}
 
 		return runServer(gCtx, log, Options{
-			Name:        "data",
-			BaseDir:     cfg.Dir,
-			BinaryPath:  cfg.Mongod,
-			ReplicaSet:  rsData,
-			ShardServer: true,
+			Name:       "data",
+			BaseDir:    cfg.Dir,
+			BinaryPath: cfg.Mongod,
+			ReplicaSet: rsData,
+			Type:       DataServer,
 
 			OnReady: func(ctx context.Context, client *mongo.Client) error {
 				// Initializing replica set.
@@ -285,7 +300,7 @@ func ensureCluster(ctx context.Context, log *zap.Logger, cfg ClusterConfig) erro
 		return runServer(gCtx, log, Options{
 			Name:             "routing",
 			BinaryPath:       cfg.Mongos,
-			RoutingServer:    true,
+			Type:             RoutingServer,
 			ConfigServerAddr: path.Join(rsConfig, "127.0.0.1:28001"),
 
 			OnReady: func(ctx context.Context, client *mongo.Client) error {
@@ -339,7 +354,7 @@ func run(ctx context.Context, log *zap.Logger) error {
 	if err := ensureCluster(ctx, log, ClusterConfig{
 		Mongod: *mongod,
 		Mongos: *mongos,
-		Dir:    *baseDir,
+		Dir:    filepath.Join(*baseDir, "cloud_data"),
 		DB:     "cloud",
 		OnSetup: func(ctx context.Context, client *mongo.Client) error {
 			log.Info("Cluster is up")
