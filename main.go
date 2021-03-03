@@ -12,6 +12,8 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -159,8 +161,8 @@ func runServer(ctx context.Context, log *zap.Logger, opt Options) error {
 		return cmd.Run()
 	})
 	g.Go(func() error {
-		// Waiting up to 10 seconds for mongo server to be available.
-		ctx, cancel := context.WithTimeout(gCtx, time.Second*5)
+		// Waiting up to 30 seconds for mongo server to be available.
+		ctx, cancel := context.WithTimeout(gCtx, time.Second*30)
 		defer cancel()
 
 		uri := &url.URL{
@@ -204,8 +206,15 @@ type ClusterConfig struct {
 	Dir string // base directory
 	DB  string // database name
 
+	Replicas int
+	Shards   int
+
 	// OnSetup is called
 	OnSetup func(ctx context.Context, client *mongo.Client) error
+}
+
+func dataPort(shardID, id int) int {
+	return 29000 + shardID*100 + id
 }
 
 func ensureCluster(ctx context.Context, log *zap.Logger, cfg ClusterConfig) error {
@@ -258,35 +267,56 @@ func ensureCluster(ctx context.Context, log *zap.Logger, cfg ClusterConfig) erro
 			return gCtx.Err()
 		}
 
-		return runServer(gCtx, log, Options{
-			Name:       "data",
-			BaseDir:    cfg.Dir,
-			BinaryPath: cfg.Mongod,
-			ReplicaSet: rsData,
-			Type:       DataServer,
+		dG, dCtx := errgroup.WithContext(gCtx)
 
-			OnReady: func(ctx context.Context, client *mongo.Client) error {
-				// Initializing replica set.
-				rsConfig := bson.M{
-					"_id": rsData,
-					"members": []bson.M{
-						{"_id": 0, "host": "127.0.0.1:29001"},
+		for shardID := 0; shardID < cfg.Shards; shardID++ {
+			rsName := fmt.Sprintf("%s%d", rsData, shardID)
+
+			var members []bson.M
+			for id := 0; id < cfg.Replicas; id++ {
+				members = append(members,
+					bson.M{
+						"_id":  id,
+						"host": fmt.Sprintf("127.0.0.1:%d", dataPort(shardID, id)),
 					},
+				)
+			}
+			rsConfig := bson.M{
+				"_id":     rsName,
+				"members": members,
+			}
+
+			var initOnce sync.Once
+
+			for id := 0; id < cfg.Replicas; id++ {
+				opt := Options{
+					Name:       fmt.Sprintf("data-%d-%d", shardID, id),
+					BaseDir:    cfg.Dir,
+					BinaryPath: cfg.Mongod,
+					ReplicaSet: rsName,
+					Type:       DataServer,
+
+					OnReady: func(ctx context.Context, client *mongo.Client) error {
+						var err error
+						initOnce.Do(func() {
+							err = client.Database("admin").
+								RunCommand(ctx, bson.M{"replSetInitiate": rsConfig}).
+								Err()
+						})
+						return err
+					},
+
+					IP:   "127.0.0.1",
+					Port: dataPort(shardID, id),
 				}
-				if err := client.Database("admin").
-					RunCommand(ctx, bson.M{"replSetInitiate": rsConfig}).
-					Err(); err != nil {
-					return xerrors.Errorf("replSetInitiate: %w", err)
-				}
 
-				log.Info("Data replica set initialized")
+				dG.Go(func() error {
+					return runServer(dCtx, log, opt)
+				})
+			}
+		}
 
-				return nil
-			},
-
-			IP:   "127.0.0.1",
-			Port: 29001,
-		})
+		return dG.Wait()
 	})
 
 	// Routing or "mongos" servers.
@@ -304,13 +334,24 @@ func ensureCluster(ctx context.Context, log *zap.Logger, cfg ClusterConfig) erro
 			ConfigServerAddr: path.Join(rsConfig, "127.0.0.1:28001"),
 
 			OnReady: func(ctx context.Context, client *mongo.Client) error {
-				if err := client.Database("admin").
-					RunCommand(ctx, bson.M{"addShard": path.Join(rsData, "127.0.0.1:29001")}).
-					Err(); err != nil {
-					return xerrors.Errorf("addShard: %w", err)
+				// Add every shard.
+				for shardID := 0; shardID < cfg.Shards; shardID++ {
+					// Specify every replica set member.
+					rsName := fmt.Sprintf("%s%d", rsData, shardID)
+					var rsAddr []string
+					for id := 0; id < cfg.Replicas; id++ {
+						rsAddr = append(rsAddr, fmt.Sprintf("127.0.0.1:%d", dataPort(shardID, id)))
+					}
+					if err := client.Database("admin").
+						RunCommand(ctx, bson.M{
+							"addShard": path.Join(rsName, strings.Join(rsAddr, ",")),
+						}).
+						Err(); err != nil {
+						return xerrors.Errorf("addShard: %w", err)
+					}
 				}
 
-				log.Info("Shard added")
+				log.Info("Shards added")
 
 				log.Info("Initializing database")
 				// Mongo does not provide explicit way to create database.
@@ -345,17 +386,21 @@ func ensureCluster(ctx context.Context, log *zap.Logger, cfg ClusterConfig) erro
 
 func run(ctx context.Context, log *zap.Logger) error {
 	var (
-		mongod  = flag.String("mongod", "/usr/bin/mongod", "path for mongod")
-		mongos  = flag.String("mongos", "/usr/bin/mongos", "path for mongos")
-		baseDir = flag.String("dir", "", "dir to use for data (default to current dir)")
+		mongod   = flag.String("mongod", "/usr/bin/mongod", "path for mongod")
+		mongos   = flag.String("mongos", "/usr/bin/mongos", "path for mongos")
+		shards   = flag.Int("shards", 2, "count of shards")
+		replicas = flag.Int("replicas", 3, "count of replicas")
+		baseDir  = flag.String("dir", "", "dir to use for data (default to current dir)")
 	)
 	flag.Parse()
 
 	if err := ensureCluster(ctx, log, ClusterConfig{
-		Mongod: *mongod,
-		Mongos: *mongos,
-		Dir:    filepath.Join(*baseDir, "cloud_data"),
-		DB:     "cloud",
+		Mongod:   *mongod,
+		Mongos:   *mongos,
+		Shards:   *shards,
+		Replicas: *replicas,
+		Dir:      filepath.Join(*baseDir, "cloud_data"),
+		DB:       "cloud",
 		OnSetup: func(ctx context.Context, client *mongo.Client) error {
 			log.Info("Cluster is up")
 			return nil
