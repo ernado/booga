@@ -274,12 +274,10 @@ func ensureCluster(ctx context.Context, log *zap.Logger, cfg ClusterConfig) erro
 
 			var members []bson.M
 			for id := 0; id < cfg.Replicas; id++ {
-				members = append(members,
-					bson.M{
-						"_id":  id,
-						"host": fmt.Sprintf("127.0.0.1:%d", dataPort(shardID, id)),
-					},
-				)
+				members = append(members, bson.M{
+					"_id":  id,
+					"host": fmt.Sprintf("127.0.0.1:%d", dataPort(shardID, id)),
+				})
 			}
 			rsConfig := bson.M{
 				"_id":     rsName,
