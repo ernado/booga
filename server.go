@@ -2,10 +2,8 @@ package booga
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -34,8 +32,6 @@ type Cluster struct {
 	dir string // base directory
 	db  string // database name
 
-	addr string
-
 	replicas int
 	shards   int
 
@@ -50,7 +46,6 @@ func New(opt Config) *Cluster {
 		mongos:   opt.Mongos,
 		dir:      opt.Dir,
 		db:       "cloud",
-		addr:     opt.Addr,
 		replicas: opt.Replicas,
 		shards:   opt.Shards,
 		onSetup:  opt.OnSetup,
@@ -217,7 +212,6 @@ type Config struct {
 
 	// OnSetup is called
 	OnSetup func(ctx context.Context, client *mongo.Client) error
-	Addr    string
 }
 
 func dataPort(shardID, id int) int {
@@ -432,30 +426,5 @@ func (c *Cluster) setup(ctx context.Context, client *mongo.Client) error {
 }
 
 func (c *Cluster) Run(ctx context.Context) error {
-	g, gCtx := errgroup.WithContext(ctx)
-
-	server := &http.Server{
-		Addr: c.addr,
-	}
-	g.Go(func() error {
-		defer c.log.Named("http").Info("Server closed")
-
-		// Waiting until group context is done.
-		<-gCtx.Done()
-
-		// Allowing some timeout for graceful shutdown.
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
-		defer closeCancel()
-
-		return server.Shutdown(closeCtx)
-	})
-	g.Go(func() error {
-		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
-		return nil
-	})
-	g.Go(func() error { return c.ensure(ctx) })
-
-	return g.Wait()
+	return c.ensure(ctx)
 }
