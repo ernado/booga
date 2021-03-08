@@ -1,4 +1,4 @@
-package main
+package booga
 
 import (
 	"context"
@@ -42,7 +42,7 @@ type Cluster struct {
 	onSetup func(ctx context.Context, client *mongo.Client) error
 }
 
-func NewCluster(opt ClusterConfig) *Cluster {
+func New(opt Config) *Cluster {
 	return &Cluster{
 		log: opt.Log,
 
@@ -75,27 +75,27 @@ func ensureTempDir(name string) (context.CancelFunc, error) {
 	}, nil
 }
 
-type ServerType byte
+type serverType byte
 
 const (
-	// DataServer is just regular mongo instance.
-	DataServer ServerType = iota
-	// ConfigServer is topology configuration mongo instance.
-	ConfigServer
-	// RoutingServer is router (proxy) for queries, mongos.
-	RoutingServer
+	// dataServer is just regular mongo instance.
+	dataServer serverType = iota
+	// configServer is topology configuration mongo instance.
+	configServer
+	// routingServer is router (proxy) for queries, mongos.
+	routingServer
 )
 
-// Options for running mongo.
-type Options struct {
-	Type       ServerType
+// serverOptions for running mongo.
+type serverOptions struct {
+	Type       serverType
 	BinaryPath string
 	Name       string
 
-	ReplicaSet string // only for ConfigServer or DataServer
-	BaseDir    string // only for ConfigServer or DataServer
+	ReplicaSet string // only for configServer or dataServer
+	BaseDir    string // only for configServer or dataServer
 
-	ConfigServerAddr string // only for RoutingServer
+	ConfigServerAddr string // only for routingServer
 
 	OnReady func(ctx context.Context, client *mongo.Client) error
 
@@ -105,12 +105,12 @@ type Options struct {
 
 // runServer runs mongo server with provided options until error or context
 // cancellation.
-func (c *Cluster) runServer(ctx context.Context, opt Options) error {
+func (c *Cluster) runServer(ctx context.Context, opt serverOptions) error {
 	log := c.log.Named(opt.Name)
 
 	dir := filepath.Join(opt.BaseDir, opt.Name)
 	switch opt.Type {
-	case DataServer, ConfigServer:
+	case dataServer, configServer:
 		// Ensuring instance directory.
 		log.Info("State will be persisted to tmp directory", zap.String("dir", dir))
 		cleanup, err := ensureTempDir(dir)
@@ -135,20 +135,20 @@ func (c *Cluster) runServer(ctx context.Context, opt Options) error {
 		}
 
 		switch opt.Type {
-		case ConfigServer:
+		case configServer:
 			args = append(args, "--configsvr")
-		case DataServer:
+		case dataServer:
 			args = append(args, "--shardsvr")
 		}
 
 		switch opt.Type {
-		case ConfigServer, DataServer:
+		case configServer, dataServer:
 			args = append(args,
 				"--replSet", opt.ReplicaSet,
 				"--dbpath", ".",
 				"--wiredTigerCacheSizeGB", "2",
 			)
-		case RoutingServer:
+		case routingServer:
 			// Routing server is stateless.
 			args = append(args, "--configdb", opt.ConfigServerAddr)
 		}
@@ -158,7 +158,7 @@ func (c *Cluster) runServer(ctx context.Context, opt Options) error {
 		cmd.Stderr = logReader
 
 		switch opt.Type {
-		case ConfigServer, DataServer:
+		case configServer, dataServer:
 			cmd.Dir = dir
 		}
 
@@ -203,7 +203,7 @@ func (c *Cluster) runServer(ctx context.Context, opt Options) error {
 	return g.Wait()
 }
 
-type ClusterConfig struct {
+type Config struct {
 	Log *zap.Logger
 
 	Mongod string // mongod binary path
@@ -235,12 +235,12 @@ func (c *Cluster) ensure(ctx context.Context) error {
 
 	// Configuration servers.
 	g.Go(func() error {
-		return c.runServer(gCtx, Options{
+		return c.runServer(gCtx, serverOptions{
 			Name:       "cfg",
 			BaseDir:    c.dir,
 			BinaryPath: c.mongod,
 			ReplicaSet: rsConfig,
-			Type:       ConfigServer,
+			Type:       configServer,
 			OnReady: func(ctx context.Context, client *mongo.Client) error {
 				// Initializing config replica set.
 				rsConfig := bson.M{
@@ -294,12 +294,12 @@ func (c *Cluster) ensure(ctx context.Context) error {
 			var initOnce sync.Once
 
 			for id := 0; id < c.replicas; id++ {
-				opt := Options{
+				opt := serverOptions{
 					Name:       fmt.Sprintf("data-%d-%d", shardID, id),
 					BaseDir:    c.dir,
 					BinaryPath: c.mongod,
 					ReplicaSet: rsName,
-					Type:       DataServer,
+					Type:       dataServer,
 
 					OnReady: func(ctx context.Context, client *mongo.Client) error {
 						var err error
@@ -336,10 +336,10 @@ func (c *Cluster) ensure(ctx context.Context) error {
 			return gCtx.Err()
 		}
 
-		return c.runServer(gCtx, Options{
+		return c.runServer(gCtx, serverOptions{
 			Name:             "routing",
 			BinaryPath:       c.mongos,
-			Type:             RoutingServer,
+			Type:             routingServer,
 			ConfigServerAddr: path.Join(rsConfig, "127.0.0.1:28001"),
 
 			OnReady: func(ctx context.Context, client *mongo.Client) error {

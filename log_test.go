@@ -1,4 +1,4 @@
-package main
+package booga
 
 import (
 	"encoding/json"
