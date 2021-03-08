@@ -11,7 +11,7 @@ func TestLogParsing(t *testing.T) {
 {"remote":"127.0.0.1:50410","client":"conn3",
 "doc":{"driver":{"name":"mongo-go-driver","version":"v1.4.6"},
 "os":{"type":"linux","architecture":"amd64"},"platform":"go1.16"}}}`)
-	var e Entry
+	var e entry
 	if err := json.Unmarshal(input, &e); err != nil {
 		t.Fatal(err)
 	}

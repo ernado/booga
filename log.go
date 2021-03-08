@@ -12,10 +12,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Entry represents single mongo log entry.
+// entry represents single mongo log entry.
 //
 // See https://docs.mongodb.com/manual/reference/log-messages/
-type Entry struct {
+type entry struct {
 	Severity   string                 `json:"s"`
 	System     string                 `json:"c"`
 	ID         int                    `json:"id"`
@@ -28,8 +28,8 @@ type Entry struct {
 	} `json:"t"`
 }
 
-// Log writes Entry to zap logger as structured log entry.
-func (e *Entry) Log(log *zap.Logger) {
+// Log writes entry to zap logger as structured log entry.
+func (e *entry) Log(log *zap.Logger) {
 	var severity zapcore.Level
 	switch e.Severity {
 	case "W":
@@ -70,7 +70,7 @@ func logProxy(log *zap.Logger, g *errgroup.Group) (io.Writer, context.CancelFunc
 		log.Info("Log streaming started")
 		defer log.Info("Log streaming ended")
 		for s.Scan() {
-			var e Entry
+			var e entry
 			if err := json.Unmarshal(s.Bytes(), &e); err != nil {
 				log.Warn("Failed to unmarshal log entry", zap.Error(err))
 				continue
