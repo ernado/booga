@@ -39,7 +39,7 @@ func (e *entry) Log(log *zap.Logger) {
 		severity = zapcore.ErrorLevel
 	}
 	if ce := log.Check(severity, e.Message); ce != nil {
-		// Here wer ignore time.
+		// We ignore time field here.
 		fields := []zapcore.Field{
 			zap.String("c", e.System),
 			zap.Int("id", e.ID),
