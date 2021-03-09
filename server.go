@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,20 +36,29 @@ type Cluster struct {
 	replicas int
 	shards   int
 
-	onSetup func(ctx context.Context, client *mongo.Client) error
+	maxCacheGB float64
+
+	onSetup      func(ctx context.Context, client *mongo.Client) error
+	setupTimeout time.Duration
+	services     map[string]func()
 }
 
 func New(opt Config) *Cluster {
 	return &Cluster{
 		log: opt.Log,
 
-		mongod:   opt.Mongod,
-		mongos:   opt.Mongos,
-		dir:      opt.Dir,
-		db:       "cloud",
-		replicas: opt.Replicas,
-		shards:   opt.Shards,
-		onSetup:  opt.OnSetup,
+		mongod:     opt.Mongod,
+		mongos:     opt.Mongos,
+		dir:        opt.Dir,
+		db:         "cloud",
+		replicas:   opt.Replicas,
+		shards:     opt.Shards,
+		maxCacheGB: opt.MaxCacheGB,
+
+		setupTimeout: opt.SetupTimeout,
+		onSetup:      opt.OnSetup,
+
+		services: map[string]func(){},
 	}
 }
 
@@ -141,29 +151,29 @@ func (c *Cluster) runServer(ctx context.Context, opt serverOptions) error {
 			args = append(args,
 				"--replSet", opt.ReplicaSet,
 				"--dbpath", ".",
-				"--wiredTigerCacheSizeGB", "2",
 			)
+			if c.maxCacheGB > 0 {
+				args = append(args, "--wiredTigerCacheSizeGB", fmt.Sprintf("%f", c.maxCacheGB))
+			}
 		case routingServer:
 			// Routing server is stateless.
 			args = append(args, "--configdb", opt.ConfigServerAddr)
 		}
 
-		cmd := exec.CommandContext(gCtx, opt.BinaryPath, args...)
-		cmd.Stdout = logReader
-		cmd.Stderr = logReader
+		return c.runRegistered(gCtx, opt.Name, func(ctx context.Context) error {
+			cmd := exec.CommandContext(ctx, opt.BinaryPath, args...)
+			cmd.Stdout = logReader
+			cmd.Stderr = logReader
 
-		switch opt.Type {
-		case configServer, dataServer:
-			cmd.Dir = dir
-		}
+			switch opt.Type {
+			case configServer, dataServer:
+				cmd.Dir = dir
+			}
 
-		return cmd.Run()
+			return cmd.Run()
+		})
 	})
 	g.Go(func() error {
-		// Waiting up to 30 seconds for mongo server to be available.
-		ctx, cancel := context.WithTimeout(gCtx, time.Second*30)
-		defer cancel()
-
 		uri := &url.URL{
 			Scheme: "mongodb",
 			Host:   net.JoinHostPort(opt.IP, strconv.Itoa(opt.Port)),
@@ -184,7 +194,10 @@ func (c *Cluster) runServer(ctx context.Context, opt serverOptions) error {
 			log.Info("Disconnected")
 		}()
 
-		if err := ensureServer(ctx, log, client); err != nil {
+		ensureCtx, cancel := context.WithTimeout(gCtx, c.setupTimeout)
+		defer cancel()
+
+		if err := ensureServer(ensureCtx, log, client); err != nil {
 			return xerrors.Errorf("ensure server: %w", err)
 		}
 
@@ -210,8 +223,10 @@ type Config struct {
 	Replicas int
 	Shards   int
 
-	// OnSetup is called
-	OnSetup func(ctx context.Context, client *mongo.Client) error
+	MaxCacheGB float64
+
+	OnSetup      func(ctx context.Context, client *mongo.Client) error
+	SetupTimeout time.Duration
 }
 
 func dataPort(shardID, id int) int {
@@ -427,4 +442,39 @@ func (c *Cluster) setup(ctx context.Context, client *mongo.Client) error {
 
 func (c *Cluster) Run(ctx context.Context) error {
 	return c.ensure(ctx)
+}
+
+func (c *Cluster) runRegistered(parentCtx context.Context, name string, f func(ctx context.Context) error) error {
+	ctx, cancel := context.WithCancel(parentCtx)
+
+	g, gCtx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return f(gCtx)
+	})
+
+	c.services[name] = cancel
+
+	return g.Wait()
+}
+
+func (c *Cluster) Services() []string {
+	var services []string
+
+	for k := range c.services {
+		services = append(services, k)
+	}
+
+	sort.Strings(services)
+	return services
+}
+
+func (c *Cluster) Kill(name string) error {
+	f, ok := c.services[name]
+	if !ok {
+		return xerrors.Errorf("no service %s", name)
+	}
+
+	f()
+
+	return nil
 }
