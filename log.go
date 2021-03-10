@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"time"
 
@@ -63,6 +64,7 @@ func logProxy(log *zap.Logger, g *errgroup.Group) (io.Writer, context.CancelFunc
 
 	g.Go(func() error {
 		<-ctx.Done()
+
 		return r.Close()
 	})
 	g.Go(func() error {
@@ -73,11 +75,18 @@ func logProxy(log *zap.Logger, g *errgroup.Group) (io.Writer, context.CancelFunc
 			var e entry
 			if err := json.Unmarshal(s.Bytes(), &e); err != nil {
 				log.Warn("Failed to unmarshal log entry", zap.Error(err))
+
 				continue
 			}
+
 			e.Log(log)
 		}
-		return s.Err()
+
+		if s.Err() != nil && !errors.Is(s.Err(), io.ErrClosedPipe) {
+			return s.Err()
+		}
+
+		return nil
 	})
 
 	return w, cancel

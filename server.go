@@ -35,6 +35,7 @@ type Cluster struct {
 
 	replicas int
 	shards   int
+	topology Topology
 
 	maxCacheGB float64
 
@@ -160,7 +161,7 @@ func (c *Cluster) runServer(ctx context.Context, opt serverOptions) error {
 			args = append(args, "--configdb", opt.ConfigServerAddr)
 		}
 
-		return c.runRegistered(gCtx, opt.Name, func(ctx context.Context) error {
+		err := c.runRegistered(gCtx, opt.Name, func(ctx context.Context) error {
 			cmd := exec.CommandContext(ctx, opt.BinaryPath, args...)
 			cmd.Stdout = logReader
 			cmd.Stderr = logReader
@@ -172,6 +173,8 @@ func (c *Cluster) runServer(ctx context.Context, opt serverOptions) error {
 
 			return cmd.Run()
 		})
+
+		return err
 	})
 	g.Go(func() error {
 		uri := &url.URL{
@@ -387,6 +390,9 @@ func (c *Cluster) ensure(ctx context.Context) error {
 
 				c.log.Info("Sharding enabled", zap.String("db", c.db))
 
+				// Start monitoring cluster topology
+				go c.MonitorTopology(ctx, "127.0.0.1:29501")
+
 				if err := c.setup(ctx, client); err != nil {
 					return xerrors.Errorf("OnSetup: %w", err)
 				}
@@ -449,7 +455,16 @@ func (c *Cluster) runRegistered(parentCtx context.Context, name string, f func(c
 
 	g, gCtx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		return f(gCtx)
+		if err := f(gCtx); err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				return err
+			}
+		}
+
+		return nil
 	})
 
 	c.services[name] = cancel
@@ -477,4 +492,137 @@ func (c *Cluster) Kill(name string) error {
 	f()
 
 	return nil
+}
+
+type Topology struct {
+	Shards []Shard
+}
+
+type Shard struct {
+	ID               string                   `bson:"_id"`
+	Host             string                   `bson:"host"`
+	State            uint64                   `bson:"state"`
+	ReplicaSetStatus map[string]ReplicaStatus `bson:"-"`
+	replicaSetAddrs  []string                 `bson:"-"`
+}
+
+type ReplicaSetStatus struct {
+	Members []ReplicaStatus `bson:"members"`
+}
+
+type ReplicaStatus struct {
+	Addr   string `bson:"name"`
+	Health uint64 `bson:"health"`
+	State  string `bson:"stateStr"`
+}
+
+func (c *Cluster) Topology() Topology {
+	return c.topology
+}
+
+func (c *Cluster) MonitorTopology(ctx context.Context, mongosAddr string) {
+	mongos := connectInstance(ctx, c.log, mongosAddr)
+
+	defer func() {
+		_ = mongos.Disconnect(ctx)
+	}()
+
+	t := time.NewTicker(time.Second)
+
+	for {
+		select {
+		case <-t.C:
+			topology, err := getTopology(ctx, mongos)
+			if err != nil {
+				c.log.Error("failed to get cluster topology", zap.Error(err))
+
+				continue
+			}
+
+			c.topology = *topology
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func connectInstance(ctx context.Context, log *zap.Logger, addr string) *mongo.Client {
+	t := time.NewTicker(time.Second)
+
+	for range t.C {
+		client, err := mongo.Connect(ctx, options.Client().
+			ApplyURI(fmt.Sprintf("mongodb://%s", addr)).
+			// SetDirect is important, client can timeout otherwise.
+			SetDirect(true),
+		)
+		if err != nil {
+			log.Error("failed to connect to mongo instance", zap.String("addr", addr))
+
+			continue
+		}
+
+		return client
+	}
+
+	return nil
+}
+
+func getTopology(ctx context.Context, mongos *mongo.Client) (*Topology, error) {
+	cursor, err := mongos.Database("config").Collection("shards").
+		Find(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+
+	shards := make([]Shard, 0)
+
+	for cursor.Next(ctx) {
+		shard := Shard{
+			ReplicaSetStatus: make(map[string]ReplicaStatus),
+		}
+
+		if err := cursor.Decode(&shard); err != nil {
+			return nil, err
+		}
+
+		shard.replicaSetAddrs = strings.Split(strings.TrimPrefix(shard.Host, fmt.Sprintf("%s/", shard.ID)), ",")
+
+		shards = append(shards, shard)
+		for _, replicaAddr := range shard.replicaSetAddrs {
+			c, err := mongo.Connect(ctx, options.Client().
+				ApplyURI(fmt.Sprintf("mongodb://%s", replicaAddr)))
+			if err != nil {
+				shard.ReplicaSetStatus[replicaAddr] = ReplicaStatus{
+					Addr:   replicaAddr,
+					Health: 0,
+				}
+
+				continue
+			}
+
+			defer func() {
+				_ = c.Disconnect(ctx)
+			}()
+
+			var rsStatus ReplicaSetStatus
+
+			if err := c.Database("admin").RunCommand(ctx, bson.D{{"replSetGetStatus", 1}}).
+				Decode(&rsStatus); err != nil {
+				shard.ReplicaSetStatus[replicaAddr] = ReplicaStatus{
+					Addr:   replicaAddr,
+					Health: 0,
+				}
+
+				continue
+			}
+
+			for _, status := range rsStatus.Members {
+				shard.ReplicaSetStatus[status.Addr] = status
+			}
+
+			break
+		}
+	}
+
+	return &Topology{Shards: shards}, nil
 }
