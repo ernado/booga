@@ -490,6 +490,7 @@ func (c *Cluster) Kill(name string) error {
 	}
 
 	f()
+	delete(c.services, name)
 
 	return nil
 }
@@ -587,32 +588,26 @@ func getTopology(ctx context.Context, mongos *mongo.Client) (*Topology, error) {
 
 		shard.replicaSetAddrs = strings.Split(strings.TrimPrefix(shard.Host, fmt.Sprintf("%s/", shard.ID)), ",")
 
-		shards = append(shards, shard)
 		for _, replicaAddr := range shard.replicaSetAddrs {
-			c, err := mongo.Connect(ctx, options.Client().
-				ApplyURI(fmt.Sprintf("mongodb://%s", replicaAddr)))
-			if err != nil {
-				shard.ReplicaSetStatus[replicaAddr] = ReplicaStatus{
-					Addr:   replicaAddr,
-					Health: 0,
-				}
+			tctx, _ := context.WithTimeout(ctx, time.Millisecond*100)
 
+			c, err := mongo.Connect(tctx, options.Client().
+				ApplyURI(fmt.Sprintf("mongodb://%s", replicaAddr)).
+				SetDirect(true))
+			if err != nil {
 				continue
 			}
 
 			defer func() {
-				_ = c.Disconnect(ctx)
+				tctx, _ := context.WithTimeout(ctx, time.Millisecond*100)
+				_ = c.Disconnect(tctx)
 			}()
 
 			var rsStatus ReplicaSetStatus
+			tctx, _ = context.WithTimeout(ctx, time.Millisecond*100)
 
-			if err := c.Database("admin").RunCommand(ctx, bson.D{{"replSetGetStatus", 1}}).
+			if err := c.Database("admin").RunCommand(tctx, bson.D{{"replSetGetStatus", 1}}).
 				Decode(&rsStatus); err != nil {
-				shard.ReplicaSetStatus[replicaAddr] = ReplicaStatus{
-					Addr:   replicaAddr,
-					Health: 0,
-				}
-
 				continue
 			}
 
@@ -622,6 +617,8 @@ func getTopology(ctx context.Context, mongos *mongo.Client) (*Topology, error) {
 
 			break
 		}
+
+		shards = append(shards, shard)
 	}
 
 	return &Topology{Shards: shards}, nil
