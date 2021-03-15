@@ -41,7 +41,15 @@ type Cluster struct {
 
 	onSetup      func(ctx context.Context, client *mongo.Client) error
 	setupTimeout time.Duration
-	services     map[string]func()
+	services     map[string]Service
+	servicesMu   sync.RWMutex
+}
+
+type Service struct {
+	Type   serverType
+	Addr   string
+	Conn   *mongo.Client
+	Cancel func()
 }
 
 func New(opt Config) *Cluster {
@@ -59,7 +67,7 @@ func New(opt Config) *Cluster {
 		setupTimeout: opt.SetupTimeout,
 		onSetup:      opt.OnSetup,
 
-		services: map[string]func(){},
+		services: make(map[string]Service),
 	}
 }
 
@@ -161,7 +169,17 @@ func (c *Cluster) runServer(ctx context.Context, opt serverOptions) error {
 			args = append(args, "--configdb", opt.ConfigServerAddr)
 		}
 
-		err := c.runRegistered(gCtx, opt.Name, func(ctx context.Context) error {
+		registerCtx, cancel := context.WithCancel(gCtx)
+
+		c.servicesMu.Lock()
+		c.services[opt.Name] = Service{
+			Addr:   fmt.Sprintf("%s:%d", opt.IP, opt.Port),
+			Type:   opt.Type,
+			Cancel: cancel,
+		}
+		c.servicesMu.Unlock()
+
+		err := c.runRegistered(registerCtx, func(ctx context.Context) error {
 			cmd := exec.CommandContext(ctx, opt.BinaryPath, args...)
 			cmd.Stdout = logReader
 			cmd.Stderr = logReader
@@ -173,6 +191,18 @@ func (c *Cluster) runServer(ctx context.Context, opt serverOptions) error {
 
 			return cmd.Run()
 		})
+
+		c.servicesMu.Lock()
+		if s, exists := c.services[opt.Name]; exists {
+			delete(c.services, opt.Name)
+
+			if s.Conn != nil {
+				defer func() {
+					_ = s.Conn.Disconnect(context.Background())
+				}()
+			}
+		}
+		c.servicesMu.Unlock()
 
 		return err
 	})
@@ -192,17 +222,24 @@ func (c *Cluster) runServer(ctx context.Context, opt serverOptions) error {
 			return xerrors.Errorf("connect: %w", err)
 		}
 
-		defer func() {
-			_ = client.Disconnect(ctx)
-			log.Info("Disconnected")
-		}()
-
 		ensureCtx, cancel := context.WithTimeout(gCtx, c.setupTimeout)
 		defer cancel()
 
 		if err := ensureServer(ensureCtx, log, client); err != nil {
 			return xerrors.Errorf("ensure server: %w", err)
 		}
+
+		c.servicesMu.Lock()
+		s, exists := c.services[opt.Name]
+		if !exists {
+			c.servicesMu.Unlock()
+
+			return xerrors.Errorf("impossible connection to unregistered service")
+		}
+
+		s.Conn = client
+		c.services[opt.Name] = s
+		c.servicesMu.Unlock()
 
 		if err := opt.OnReady(gCtx, client); err != nil {
 			return xerrors.Errorf("onReady: %w", err)
@@ -391,7 +428,7 @@ func (c *Cluster) ensure(ctx context.Context) error {
 				c.log.Info("Sharding enabled", zap.String("db", c.db))
 
 				// Start monitoring cluster topology
-				go c.MonitorTopology(ctx, "127.0.0.1:29501")
+				go c.MonitorTopology(ctx)
 
 				if err := c.setup(ctx, client); err != nil {
 					return xerrors.Errorf("OnSetup: %w", err)
@@ -450,9 +487,7 @@ func (c *Cluster) Run(ctx context.Context) error {
 	return c.ensure(ctx)
 }
 
-func (c *Cluster) runRegistered(parentCtx context.Context, name string, f func(ctx context.Context) error) error {
-	ctx, cancel := context.WithCancel(parentCtx)
-
+func (c *Cluster) runRegistered(ctx context.Context, f func(ctx context.Context) error) error {
 	g, gCtx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		if err := f(gCtx); err != nil {
@@ -466,8 +501,6 @@ func (c *Cluster) runRegistered(parentCtx context.Context, name string, f func(c
 
 		return nil
 	})
-
-	c.services[name] = cancel
 
 	return g.Wait()
 }
@@ -484,13 +517,15 @@ func (c *Cluster) Services() []string {
 }
 
 func (c *Cluster) Kill(name string) error {
-	f, ok := c.services[name]
-	if !ok {
+	c.servicesMu.RLock()
+	defer c.servicesMu.RUnlock()
+
+	s, ok := c.services[name]
+	if !ok || s.Cancel == nil {
 		return xerrors.Errorf("no service %s", name)
 	}
 
-	f()
-	delete(c.services, name)
+	s.Cancel()
 
 	return nil
 }
@@ -521,19 +556,14 @@ func (c *Cluster) Topology() Topology {
 	return c.topology
 }
 
-func (c *Cluster) MonitorTopology(ctx context.Context, mongosAddr string) {
-	mongos := connectInstance(ctx, c.log, mongosAddr)
-
-	defer func() {
-		_ = mongos.Disconnect(ctx)
-	}()
-
+func (c *Cluster) MonitorTopology(ctx context.Context) {
 	t := time.NewTicker(time.Second)
 
 	for {
 		select {
 		case <-t.C:
-			topology, err := getTopology(ctx, mongos)
+
+			topology, err := c.getTopology(ctx)
 			if err != nil {
 				c.log.Error("failed to get cluster topology", zap.Error(err))
 
@@ -547,28 +577,25 @@ func (c *Cluster) MonitorTopology(ctx context.Context, mongosAddr string) {
 	}
 }
 
-func connectInstance(ctx context.Context, log *zap.Logger, addr string) *mongo.Client {
-	t := time.NewTicker(time.Second)
+func (c *Cluster) getTopology(ctx context.Context) (*Topology, error) {
+	c.servicesMu.RLock()
+	defer c.servicesMu.RUnlock()
 
-	for range t.C {
-		client, err := mongo.Connect(ctx, options.Client().
-			ApplyURI(fmt.Sprintf("mongodb://%s", addr)).
-			// SetDirect is important, client can timeout otherwise.
-			SetDirect(true),
-		)
-		if err != nil {
-			log.Error("failed to connect to mongo instance", zap.String("addr", addr))
+	// find mongos
+	var mongos *mongo.Client
 
-			continue
+	for _, service := range c.services {
+		if service.Type == routingServer && service.Conn != nil {
+			mongos = service.Conn
+
+			break
 		}
-
-		return client
 	}
 
-	return nil
-}
+	if mongos == nil {
+		return nil, xerrors.Errorf("connection to mongos is not established")
+	}
 
-func getTopology(ctx context.Context, mongos *mongo.Client) (*Topology, error) {
 	cursor, err := mongos.Database("config").Collection("shards").
 		Find(ctx, bson.D{})
 	if err != nil {
@@ -589,24 +616,26 @@ func getTopology(ctx context.Context, mongos *mongo.Client) (*Topology, error) {
 		shard.replicaSetAddrs = strings.Split(strings.TrimPrefix(shard.Host, fmt.Sprintf("%s/", shard.ID)), ",")
 
 		for _, replicaAddr := range shard.replicaSetAddrs {
-			tctx, _ := context.WithTimeout(ctx, time.Millisecond*100)
+			// find replica by addr
+			var conn *mongo.Client
 
-			c, err := mongo.Connect(tctx, options.Client().
-				ApplyURI(fmt.Sprintf("mongodb://%s", replicaAddr)).
-				SetDirect(true))
-			if err != nil {
+			for _, service := range c.services {
+				if service.Addr == replicaAddr && service.Conn != nil {
+					conn = service.Conn
+
+					break
+				}
+			}
+
+			if conn == nil {
 				continue
 			}
 
-			defer func() {
-				tctx, _ := context.WithTimeout(ctx, time.Millisecond*100)
-				_ = c.Disconnect(tctx)
-			}()
-
 			var rsStatus ReplicaSetStatus
-			tctx, _ = context.WithTimeout(ctx, time.Millisecond*100)
 
-			if err := c.Database("admin").RunCommand(tctx, bson.D{{"replSetGetStatus", 1}}).
+			tctx, _ := context.WithTimeout(ctx, time.Millisecond*100)
+
+			if err := conn.Database("admin").RunCommand(tctx, bson.D{{Key: "replSetGetStatus", Value: 1}}).
 				Decode(&rsStatus); err != nil {
 				continue
 			}
