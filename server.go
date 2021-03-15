@@ -19,6 +19,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
@@ -38,6 +39,8 @@ type Cluster struct {
 	topology Topology
 
 	maxCacheGB float64
+
+	opentelemetry bool
 
 	onSetup      func(ctx context.Context, client *mongo.Client) error
 	setupTimeout time.Duration
@@ -63,6 +66,8 @@ func New(opt Config) *Cluster {
 		replicas:   opt.Replicas,
 		shards:     opt.Shards,
 		maxCacheGB: opt.MaxCacheGB,
+
+		opentelemetry: opt.Opentelemetry,
 
 		setupTimeout: opt.SetupTimeout,
 		onSetup:      opt.OnSetup,
@@ -213,11 +218,17 @@ func (c *Cluster) runServer(ctx context.Context, opt serverOptions) error {
 			Path:   "/",
 		}
 
-		client, err := mongo.Connect(ctx, options.Client().
+		opts := options.Client().
 			ApplyURI(uri.String()).
 			// SetDirect is important, client can timeout otherwise.
-			SetDirect(true),
-		)
+			SetDirect(true)
+
+		if c.opentelemetry {
+			opts.Monitor = otelmongo.NewMonitor(opt.Name)
+		}
+
+		client, err := mongo.Connect(ctx, opts)
+
 		if err != nil {
 			return xerrors.Errorf("connect: %w", err)
 		}
@@ -264,6 +275,8 @@ type Config struct {
 	Shards   int
 
 	MaxCacheGB float64
+
+	Opentelemetry bool
 
 	OnSetup      func(ctx context.Context, client *mongo.Client) error
 	SetupTimeout time.Duration
